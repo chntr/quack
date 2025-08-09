@@ -2,6 +2,19 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useAccount, useWalletClient } from 'wagmi';
+import {
+  Name,
+  Identity,
+  Address,
+  Avatar,
+  EthBalance,
+} from "@coinbase/onchainkit/identity";
+import {
+  ConnectWallet,
+  Wallet,
+  WalletDropdown,
+  WalletDropdownDisconnect,
+} from "@coinbase/onchainkit/wallet";
 import { 
   Mic, 
   Play, 
@@ -56,28 +69,41 @@ export function MobileGame({}: MobileGameProps) {
   const [newPeerAddress, setNewPeerAddress] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isConnectedToXMTP, setIsConnectedToXMTP] = useState(false);
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Add debug log
+  const addDebugLog = useCallback((message: string) => {
+    const timestamp = new Date().toLocaleTimeString();
+    const logEntry = `[${timestamp}] ${message}`;
+    console.log(logEntry);
+    setDebugInfo(prev => [...prev.slice(-9), logEntry]); // Keep last 10 logs
+  }, []);
+
   // Load games from localStorage
   const loadGamesFromStorage = useCallback(() => {
     try {
+      addDebugLog('Loading games from localStorage');
       const storedGames = localStorage.getItem('glorp-games');
       if (storedGames) {
         const parsedGames = JSON.parse(storedGames);
         setGames(parsedGames);
+        addDebugLog(`Loaded ${parsedGames.length} games from storage`);
       }
       
       const storedMessages = localStorage.getItem('glorp-messages');
       if (storedMessages) {
         const parsedMessages = JSON.parse(storedMessages);
         setMessages(parsedMessages);
+        addDebugLog(`Loaded ${parsedMessages.length} messages from storage`);
       }
     } catch (error) {
       console.error('Failed to load games from storage:', error);
+      addDebugLog(`Error loading from storage: ${error}`);
     }
-  }, []);
+  }, [addDebugLog]);
 
   // Save games to localStorage
   const saveGamesToStorage = useCallback((gameList: Game[]) => {
@@ -99,38 +125,101 @@ export function MobileGame({}: MobileGameProps) {
 
   // Connect to XMTP
   const connectToXMTP = useCallback(async () => {
-    if (!walletClient || !address) return;
+    if (!walletClient || !address) {
+      console.log('❌ Cannot connect: missing walletClient or address', { 
+        hasWalletClient: !!walletClient, 
+        hasAddress: !!address 
+      });
+      return;
+    }
 
     try {
+      addDebugLog('🚀 Starting XMTP connection...');
       setIsLoading(true);
       await xmtpGameClient.connect(walletClient);
       setIsConnectedToXMTP(true);
+      addDebugLog('✅ XMTP connection successful');
       
       // Load existing conversations from XMTP
-      const conversations = await xmtpGameClient.getConversations();
-      const xmtpGameList: Game[] = conversations.map((conv: unknown) => {
-        const conversation = conv as { id?: string; peerAddress: string };
-        return {
-          id: conversation.id || conversation.peerAddress,
-          peerAddress: conversation.peerAddress,
-          peerName: `${conversation.peerAddress.slice(0, 6)}...${conversation.peerAddress.slice(-4)}`,
+      addDebugLog('📋 Loading conversations from XMTP...');
+            const conversations = await xmtpGameClient.getConversations();
+      addDebugLog(`📋 Found ${conversations.length} conversations`);
+
+      // Normalize conversations to a single DM per peer (dedupe by DM id or peer id)
+      const normalizedById = new Map<string, Game>();
+      const normalizedByPeer = new Map<string, Game>();
+
+      conversations.forEach((conv: any) => {
+        const idCandidate = String(
+          conv?.dmId || conv?.id || conv?.conversationId || conv?.topic || conv?.groupId || conv?.inboxId || conv?.peerInboxId || ''
+        );
+        const peerCandidate = String(conv?.peerInboxId || conv?.peerAddress || conv?.inboxId || '');
+        const labelSource = peerCandidate || idCandidate || 'Unknown';
+        const isHexLike = labelSource.startsWith('0x') && labelSource.length >= 10;
+        const peerName = isHexLike ? `${labelSource.slice(0, 6)}...${labelSource.slice(-4)}` : labelSource;
+        const game: Game = {
+          id: idCandidate || peerCandidate || `conv_${Date.now()}`,
+          peerAddress: peerCandidate || 'unknown',
+          peerName,
           unreadCount: 0,
         };
+        if (game.id) normalizedById.set(game.id, game);
+        if (game.peerAddress && game.peerAddress !== 'unknown') normalizedByPeer.set(game.peerAddress, game);
       });
-      
-      // Merge with local games
-      const localGames = games;
-      const mergedGames = [...localGames];
-      
+
+      const xmtpGameList: Game[] = Array.from(
+        new Map(
+          [...normalizedById.values(), ...normalizedByPeer.values()].map((v) => [v.id + '::' + v.peerAddress, v])
+        ).values()
+      );
+
+      // Merge with local games (by id+peer combo)
+      const mergedGames = [...games];
       xmtpGameList.forEach(xmtpGame => {
-        const existingIndex = mergedGames.findIndex(g => g.peerAddress === xmtpGame.peerAddress);
-        if (existingIndex === -1) {
-          mergedGames.push(xmtpGame);
-        }
+        const exists = mergedGames.some(g => g.id === xmtpGame.id || g.peerAddress === xmtpGame.peerAddress);
+        if (!exists) mergedGames.push(xmtpGame);
       });
       
       setGames(mergedGames);
       saveGamesToStorage(mergedGames);
+      
+      // Setup global message listener for new invitations
+      addDebugLog('🌐 Setting up global message listener...');
+      await xmtpGameClient.setupGlobalMessageListener((message) => {
+        addDebugLog(`🎯 Global message received from ${message.sender}`);
+        
+        // Check if this is a new game invitation
+        const isNewGame = !mergedGames.find(g => g.peerAddress === message.sender);
+        console.log('🔍 Checking if new game:', { 
+          isNewGame, 
+          sender: message.sender, 
+          currentAddress: address,
+          existingGames: mergedGames.map(g => g.peerAddress)
+        });
+        
+        if (isNewGame && message.sender !== address) {
+          addDebugLog('🎉 New game invitation detected!');
+          const newInvitation: Game = {
+            id: `invite_${Date.now()}`,
+            peerAddress: message.sender,
+            peerName: `${message.sender.slice(0, 6)}...${message.sender.slice(-4)}`,
+            unreadCount: 1,
+          };
+          addDebugLog(`📝 Adding new invitation from ${newInvitation.peerName}`);
+          setPendingInvitations(prev => [...prev, newInvitation]);
+        } else {
+          addDebugLog('📝 Message from existing game');
+          // Update unread count for existing game
+          const updatedGames = mergedGames.map(game => 
+            game.peerAddress === message.sender 
+              ? { ...game, unreadCount: game.unreadCount + 1 }
+              : game
+          );
+          setGames(updatedGames);
+          saveGamesToStorage(updatedGames);
+        }
+      });
+      addDebugLog('✅ Global message listener setup complete');
     } catch (error) {
       console.error('Failed to connect to XMTP:', error);
     } finally {
@@ -204,11 +293,14 @@ export function MobileGame({}: MobileGameProps) {
     try {
       setIsLoading(true);
       const conversation = await xmtpGameClient.getOrCreateConversation(newPeerAddress);
-      
+
+      const newId = String(conversation?.id || conversation?.conversationId || conversation?.dmId || newPeerAddress);
+      const newPeer = String(newPeerAddress);
+      const peerName = `${newPeer.slice(0, 6)}...${newPeer.slice(-4)}`;
       const newGame: Game = {
-        id: conversation.id || newPeerAddress,
-        peerAddress: newPeerAddress,
-        peerName: `${newPeerAddress.slice(0, 6)}...${newPeerAddress.slice(-4)}`,
+        id: newId,
+        peerAddress: newPeer,
+        peerName,
         unreadCount: 0,
       };
       
@@ -219,10 +311,16 @@ export function MobileGame({}: MobileGameProps) {
       setCurrentView('main');
     } catch (error) {
       console.error('Failed to create game:', error);
+      alert(
+        error instanceof Error
+          ? error.message
+          : 'Failed to create conversation. The peer may not be registered on XMTP.'
+      );
     } finally {
       setIsLoading(false);
     }
   };
+
 
   // Start a game
   const startGame = async (game: Game) => {
@@ -230,7 +328,9 @@ export function MobileGame({}: MobileGameProps) {
       setIsLoading(true);
       const conversation = await xmtpGameClient.getOrCreateConversation(game.peerAddress);
       setCurrentConversation(conversation);
-      setSelectedGame(game);
+      // Update selected game with the resolved id if present
+      const resolvedId = String(conversation?.id || conversation?.conversationId || conversation?.dmId || game.id);
+      setSelectedGame({ ...game, id: resolvedId });
       
       // Clear unread count for this game
       const updatedGames = games.map(g => 
@@ -341,22 +441,31 @@ export function MobileGame({}: MobileGameProps) {
       <div className="flex flex-col h-screen bg-gray-50">
         {/* Header */}
         <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
-          <h1 className="text-xl font-bold text-gray-900">Glorp</h1>
-          <div className="flex items-center space-x-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setCurrentView('settings')}
-              className="p-2"
-            >
-              <Settings size={20} />
-            </Button>
-            {!isConnected && (
-              <Button size="sm" className="bg-blue-500 text-white">
-                Connect Wallet
-              </Button>
-            )}
+          <div className="flex items-center space-x-3">
+            <h1 className="text-xl font-bold text-gray-900">Glorp</h1>
+            <Wallet className="z-10">
+              <ConnectWallet>
+                <Name className="text-inherit text-sm" />
+              </ConnectWallet>
+              <WalletDropdown>
+                <Identity className="px-4 pt-3 pb-2" hasCopyAddressOnClick>
+                  <Avatar />
+                  <Name />
+                  <Address />
+                  <EthBalance />
+                </Identity>
+                <WalletDropdownDisconnect />
+              </WalletDropdown>
+            </Wallet>
           </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setCurrentView('settings')}
+            className="p-2"
+          >
+            <Settings size={20} />
+          </Button>
         </div>
 
         {/* Content */}
@@ -364,11 +473,8 @@ export function MobileGame({}: MobileGameProps) {
           {!isConnected ? (
             <div className="text-center py-12">
               <Gamepad2 size={64} className="mx-auto text-gray-400 mb-4" />
-              <h2 className="text-xl font-semibold mb-2">Connect to Play</h2>
-              <p className="text-gray-600 mb-6">Connect your wallet to start playing Sound Guesser!</p>
-              <Button size="lg" className="bg-blue-500 text-white">
-                Connect Wallet
-              </Button>
+              <h2 className="text-xl font-semibold text-gray-900 mb-2">Welcome to Glorp!</h2>
+              <p className="text-gray-600 mb-6">Connect your wallet in the header to start playing</p>
             </div>
           ) : (
             <>
@@ -425,7 +531,7 @@ export function MobileGame({}: MobileGameProps) {
                   <div className="text-center py-8">
                     <Users size={48} className="mx-auto text-gray-400 mb-3" />
                     <p className="text-gray-600">No active games</p>
-                    <p className="text-sm text-gray-500">Start a new game to begin playing!</p>
+                    <p className="text-sm text-gray-600">Start a new game to begin playing!</p>
                   </div>
                 ) : (
                   games.map((game) => (
@@ -441,9 +547,9 @@ export function MobileGame({}: MobileGameProps) {
                           </div>
                           <div>
                             <h3 className="font-medium text-gray-900">{game.peerName}</h3>
-                            <p className="text-sm text-gray-500">
-                              {game.lastMessage || 'No messages yet'}
-                            </p>
+                                                <p className="text-sm text-gray-600">
+                      {game.lastMessage || 'No messages yet'}
+                    </p>
                           </div>
                         </div>
                         {game.unreadCount > 0 && (
@@ -520,7 +626,7 @@ export function MobileGame({}: MobileGameProps) {
           </Button>
           <div>
             <h1 className="font-semibold">{selectedGame.peerName}</h1>
-            <p className="text-sm text-gray-500">Glorp</p>
+            <p className="text-sm text-gray-600">Glorp</p>
           </div>
         </div>
 
@@ -530,7 +636,7 @@ export function MobileGame({}: MobileGameProps) {
             <div className="text-center py-8">
               <Trophy size={48} className="mx-auto text-gray-400 mb-3" />
               <p className="text-gray-600">No challenges yet</p>
-              <p className="text-sm text-gray-500">Record a sound to start!</p>
+                                  <p className="text-sm text-gray-600">Record a sound to start!</p>
             </div>
           ) : (
             messages.map((message) => (
@@ -695,17 +801,47 @@ export function MobileGame({}: MobileGameProps) {
             <p className="text-gray-600 mb-4">
               Glorp is a fun game where you record sounds and challenge friends to guess what they are!
             </p>
-            <div className="space-y-3">
+            <div className="space-y-3 mb-6">
               <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
-                <span>Connected to XMTP</span>
+                <span className="text-black">Connected to XMTP</span>
                 <span className={isConnectedToXMTP ? 'text-green-500' : 'text-red-500'}>
                   {isConnectedToXMTP ? '✓' : '✗'}
                 </span>
               </div>
               <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
-                <span>Active Games</span>
-                <span className="font-semibold">{games.length}</span>
+                <span className="text-black">Active Games</span>
+                <span className="font-semibold text-black">{games.length}</span>
               </div>
+              <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <span className="text-black">Pending Invitations</span>
+                <span className="font-semibold text-black">{pendingInvitations.length}</span>
+              </div>
+              <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <span className="text-black">Total Messages</span>
+                <span className="font-semibold text-black">{messages.length}</span>
+              </div>
+            </div>
+            
+            {/* Debug Panel */}
+            <div className="border-t pt-4">
+              <h3 className="text-md font-semibold mb-2">Debug Logs</h3>
+              <div className="bg-black text-green-400 p-3 rounded text-xs font-mono h-32 overflow-y-auto">
+                {debugInfo.length === 0 ? (
+                  <div className="text-gray-500">No debug logs yet...</div>
+                ) : (
+                  debugInfo.map((log, index) => (
+                    <div key={index} className="mb-1">{log}</div>
+                  ))
+                )}
+              </div>
+              <Button
+                onClick={() => setDebugInfo([])}
+                variant="outline"
+                size="sm"
+                className="mt-2"
+              >
+                Clear Logs
+              </Button>
             </div>
           </div>
         </div>
