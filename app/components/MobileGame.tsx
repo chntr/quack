@@ -1,0 +1,717 @@
+"use client";
+
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { useAccount, useWalletClient } from 'wagmi';
+import { 
+  Mic, 
+  Play, 
+  Settings, 
+  Plus, 
+  User, 
+  Volume2, 
+  X, 
+  Send,
+  ChevronLeft,
+  Gamepad2,
+  Trophy,
+  Users
+} from 'lucide-react';
+import { xmtpGameClient, AudioMessage } from '../../lib/xmtp-client';
+import { getRandomSound, Sound } from '../../lib/sound-library';
+import { Button } from './Button';
+
+interface Game {
+  id: string;
+  peerAddress: string;
+  peerName: string;
+  lastMessage?: string;
+  lastMessageTime?: Date;
+  unreadCount: number;
+}
+
+interface MobileGameProps {
+  // Component props can be added here in the future
+}
+
+export function MobileGame({}: MobileGameProps) {
+  const { address, isConnected } = useAccount();
+  const { data: walletClient } = useWalletClient();
+  
+  const [currentView, setCurrentView] = useState<'main' | 'new-game' | 'game' | 'settings'>('main');
+  const [games, setGames] = useState<Game[]>([]);
+  const [selectedGame, setSelectedGame] = useState<Game | null>(null);
+  const [messages, setMessages] = useState<AudioMessage[]>([]);
+  const [currentConversation, setCurrentConversation] = useState<unknown>(null);
+  const [pendingInvitations, setPendingInvitations] = useState<Game[]>([]);
+  
+  // Recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [assignedSound, setAssignedSound] = useState<Sound | null>(null);
+  const [guess, setGuess] = useState('');
+  
+  // New game state
+  const [newPeerAddress, setNewPeerAddress] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isConnectedToXMTP, setIsConnectedToXMTP] = useState(false);
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Load games from localStorage
+  const loadGamesFromStorage = useCallback(() => {
+    try {
+      const storedGames = localStorage.getItem('glorp-games');
+      if (storedGames) {
+        const parsedGames = JSON.parse(storedGames);
+        setGames(parsedGames);
+      }
+      
+      const storedMessages = localStorage.getItem('glorp-messages');
+      if (storedMessages) {
+        const parsedMessages = JSON.parse(storedMessages);
+        setMessages(parsedMessages);
+      }
+    } catch (error) {
+      console.error('Failed to load games from storage:', error);
+    }
+  }, []);
+
+  // Save games to localStorage
+  const saveGamesToStorage = useCallback((gameList: Game[]) => {
+    try {
+      localStorage.setItem('glorp-games', JSON.stringify(gameList));
+    } catch (error) {
+      console.error('Failed to save games to storage:', error);
+    }
+  }, []);
+
+  // Save messages to localStorage
+  const saveMessagesToStorage = useCallback((messageList: AudioMessage[]) => {
+    try {
+      localStorage.setItem('glorp-messages', JSON.stringify(messageList));
+    } catch (error) {
+      console.error('Failed to save messages to storage:', error);
+    }
+  }, []);
+
+  // Connect to XMTP
+  const connectToXMTP = useCallback(async () => {
+    if (!walletClient || !address) return;
+
+    try {
+      setIsLoading(true);
+      await xmtpGameClient.connect(walletClient);
+      setIsConnectedToXMTP(true);
+      
+      // Load existing conversations from XMTP
+      const conversations = await xmtpGameClient.getConversations();
+      const xmtpGameList: Game[] = conversations.map((conv: unknown) => {
+        const conversation = conv as { id?: string; peerAddress: string };
+        return {
+          id: conversation.id || conversation.peerAddress,
+          peerAddress: conversation.peerAddress,
+          peerName: `${conversation.peerAddress.slice(0, 6)}...${conversation.peerAddress.slice(-4)}`,
+          unreadCount: 0,
+        };
+      });
+      
+      // Merge with local games
+      const localGames = games;
+      const mergedGames = [...localGames];
+      
+      xmtpGameList.forEach(xmtpGame => {
+        const existingIndex = mergedGames.findIndex(g => g.peerAddress === xmtpGame.peerAddress);
+        if (existingIndex === -1) {
+          mergedGames.push(xmtpGame);
+        }
+      });
+      
+      setGames(mergedGames);
+      saveGamesToStorage(mergedGames);
+    } catch (error) {
+      console.error('Failed to connect to XMTP:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [walletClient, address, games, saveGamesToStorage]);
+
+  useEffect(() => {
+    // Load games from localStorage on mount
+    loadGamesFromStorage();
+  }, [loadGamesFromStorage]);
+
+  useEffect(() => {
+    if (walletClient && address && !isConnectedToXMTP) {
+      connectToXMTP();
+    }
+  }, [walletClient, address, isConnectedToXMTP, connectToXMTP]);
+
+  // Start recording
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      
+      const chunks: Blob[] = [];
+      
+      mediaRecorder.ondataavailable = (event) => {
+        chunks.push(event.data);
+      };
+      
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'audio/wav' });
+        setAudioBlob(blob);
+        setAudioUrl(URL.createObjectURL(blob));
+        stream.getTracks().forEach(track => track.stop());
+      };
+      
+      mediaRecorder.start();
+      setIsRecording(true);
+    } catch (error) {
+      console.error('Failed to start recording:', error);
+    }
+  };
+
+  // Stop recording
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  };
+
+  // Play audio
+  const playAudio = (url: string) => {
+    if (audioRef.current) {
+      audioRef.current.src = url;
+      audioRef.current.play();
+      setIsPlaying(true);
+      
+      audioRef.current.onended = () => {
+        setIsPlaying(false);
+      };
+    }
+  };
+
+  // Create new game
+  const createNewGame = async () => {
+    if (!newPeerAddress.trim()) return;
+
+    try {
+      setIsLoading(true);
+      const conversation = await xmtpGameClient.getOrCreateConversation(newPeerAddress);
+      
+      const newGame: Game = {
+        id: conversation.id || newPeerAddress,
+        peerAddress: newPeerAddress,
+        peerName: `${newPeerAddress.slice(0, 6)}...${newPeerAddress.slice(-4)}`,
+        unreadCount: 0,
+      };
+      
+      const updatedGames = [...games, newGame];
+      setGames(updatedGames);
+      saveGamesToStorage(updatedGames);
+      setNewPeerAddress('');
+      setCurrentView('main');
+    } catch (error) {
+      console.error('Failed to create game:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Start a game
+  const startGame = async (game: Game) => {
+    try {
+      setIsLoading(true);
+      const conversation = await xmtpGameClient.getOrCreateConversation(game.peerAddress);
+      setCurrentConversation(conversation);
+      setSelectedGame(game);
+      
+      // Clear unread count for this game
+      const updatedGames = games.map(g => 
+        g.peerAddress === game.peerAddress 
+          ? { ...g, unreadCount: 0 }
+          : g
+      );
+      setGames(updatedGames);
+      saveGamesToStorage(updatedGames);
+      
+      // Listen for messages
+      await xmtpGameClient.listenToMessages(conversation, (message) => {
+        const updatedMessages = [...messages, message];
+        setMessages(updatedMessages);
+        saveMessagesToStorage(updatedMessages);
+        
+        // Check if this is a new game invitation
+        const isNewGame = !games.find(g => g.peerAddress === message.sender);
+        if (isNewGame && message.sender !== address) {
+          const newInvitation: Game = {
+            id: `invite_${Date.now()}`,
+            peerAddress: message.sender,
+            peerName: `${message.sender.slice(0, 6)}...${message.sender.slice(-4)}`,
+            unreadCount: 1,
+          };
+          setPendingInvitations(prev => [...prev, newInvitation]);
+        } else {
+          // Update unread count for existing game
+          const updatedGames = games.map(game => 
+            game.peerAddress === message.sender 
+              ? { ...game, unreadCount: game.unreadCount + 1 }
+              : game
+          );
+          setGames(updatedGames);
+          saveGamesToStorage(updatedGames);
+        }
+      });
+      
+      setCurrentView('game');
+    } catch (error) {
+      console.error('Failed to start game:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Send audio challenge
+  const sendAudioChallenge = async () => {
+    if (!audioBlob || !currentConversation || !assignedSound) return;
+
+    try {
+      setIsLoading(true);
+      await xmtpGameClient.sendAudioMessage(
+        currentConversation,
+        audioBlob,
+        `audio_${Date.now()}.wav`,
+        assignedSound.name
+      );
+      
+      // Clear the form
+      setAudioBlob(null);
+      setAudioUrl(null);
+      setAssignedSound(null);
+      
+      // Add to local messages
+      const newMessage: AudioMessage = {
+        id: Date.now().toString(),
+        audioUrl: audioUrl!,
+        filename: `audio_${Date.now()}.wav`,
+        timestamp: new Date(),
+        sender: address!,
+        correctAnswer: assignedSound.name,
+      };
+      const updatedMessages = [...messages, newMessage];
+      setMessages(updatedMessages);
+      saveMessagesToStorage(updatedMessages);
+    } catch (error) {
+      console.error('Failed to send audio message:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Send guess
+  const sendGuess = async (messageId: string) => {
+    if (!guess.trim() || !currentConversation) return;
+
+    try {
+      setIsLoading(true);
+      await xmtpGameClient.sendGuess(currentConversation, guess, messageId);
+      setGuess('');
+    } catch (error) {
+      console.error('Failed to send guess:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Get random sound for challenge
+  const getNewSoundChallenge = () => {
+    const sound = getRandomSound();
+    setAssignedSound(sound);
+  };
+
+  // Main screen
+  if (currentView === 'main') {
+    return (
+      <div className="flex flex-col h-screen bg-gray-50">
+        {/* Header */}
+        <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
+          <h1 className="text-xl font-bold text-gray-900">Glorp</h1>
+          <div className="flex items-center space-x-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setCurrentView('settings')}
+              className="p-2"
+            >
+              <Settings size={20} />
+            </Button>
+            {!isConnected && (
+              <Button size="sm" className="bg-blue-500 text-white">
+                Connect Wallet
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-4">
+          {!isConnected ? (
+            <div className="text-center py-12">
+              <Gamepad2 size={64} className="mx-auto text-gray-400 mb-4" />
+              <h2 className="text-xl font-semibold mb-2">Connect to Play</h2>
+              <p className="text-gray-600 mb-6">Connect your wallet to start playing Sound Guesser!</p>
+              <Button size="lg" className="bg-blue-500 text-white">
+                Connect Wallet
+              </Button>
+            </div>
+          ) : (
+            <>
+              {/* New Game Button */}
+              <Button
+                onClick={() => setCurrentView('new-game')}
+                className="w-full mb-6 bg-blue-500 text-white py-4 text-lg font-semibold"
+                icon={<Plus size={20} />}
+              >
+                Start New Game
+              </Button>
+
+              {/* Pending Invitations */}
+              {pendingInvitations.length > 0 && (
+                <div className="space-y-3 mb-6">
+                  <h2 className="text-lg font-semibold text-gray-900 mb-3">New Invitations</h2>
+                  {pendingInvitations.map((invitation) => (
+                    <div
+                      key={invitation.id}
+                      className="bg-yellow-50 border border-yellow-200 rounded-lg p-4"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-3">
+                          <div className="w-10 h-10 bg-yellow-100 rounded-full flex items-center justify-center">
+                            <User size={20} className="text-yellow-600" />
+                          </div>
+                          <div>
+                            <h3 className="font-medium text-gray-900">{invitation.peerName}</h3>
+                            <p className="text-sm text-yellow-700">Wants to play Glorp with you!</p>
+                          </div>
+                        </div>
+                        <Button
+                          onClick={() => {
+                            setPendingInvitations(prev => prev.filter(i => i.id !== invitation.id));
+                            const updatedGames = [...games, invitation];
+                            setGames(updatedGames);
+                            saveGamesToStorage(updatedGames);
+                          }}
+                          size="sm"
+                          className="bg-yellow-500 hover:bg-yellow-600 text-white"
+                        >
+                          Accept
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Games List */}
+              <div className="space-y-3">
+                <h2 className="text-lg font-semibold text-gray-900 mb-3">Active Games</h2>
+                {games.length === 0 ? (
+                  <div className="text-center py-8">
+                    <Users size={48} className="mx-auto text-gray-400 mb-3" />
+                    <p className="text-gray-600">No active games</p>
+                    <p className="text-sm text-gray-500">Start a new game to begin playing!</p>
+                  </div>
+                ) : (
+                  games.map((game) => (
+                    <div
+                      key={game.id}
+                      onClick={() => startGame(game)}
+                      className="bg-white rounded-lg p-4 border border-gray-200 active:bg-gray-50"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-3">
+                          <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
+                            <User size={20} className="text-blue-600" />
+                          </div>
+                          <div>
+                            <h3 className="font-medium text-gray-900">{game.peerName}</h3>
+                            <p className="text-sm text-gray-500">
+                              {game.lastMessage || 'No messages yet'}
+                            </p>
+                          </div>
+                        </div>
+                        {game.unreadCount > 0 && (
+                          <div className="bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                            {game.unreadCount}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // New game screen
+  if (currentView === 'new-game') {
+    return (
+      <div className="flex flex-col h-screen bg-gray-50">
+        {/* Header */}
+        <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setCurrentView('main')}
+            className="mr-3"
+          >
+            <ChevronLeft size={20} />
+          </Button>
+          <h1 className="text-lg font-semibold">New Game</h1>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 p-4">
+          <div className="bg-white rounded-lg p-6">
+            <h2 className="text-lg font-semibold mb-4">Enter Friend&apos;s Address</h2>
+            <input
+              type="text"
+              placeholder="0x..."
+              value={newPeerAddress}
+              onChange={(e) => setNewPeerAddress(e.target.value)}
+              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 mb-4 bg-white text-gray-900"
+            />
+            <Button
+              onClick={createNewGame}
+              disabled={!newPeerAddress.trim() || isLoading}
+              className="w-full bg-blue-500 text-white py-3"
+            >
+              {isLoading ? 'Creating...' : 'Start Game'}
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Game screen
+  if (currentView === 'game' && selectedGame) {
+    return (
+      <div className="flex flex-col h-screen bg-gray-50">
+        {/* Header */}
+        <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setCurrentView('main')}
+            className="mr-3"
+          >
+            <ChevronLeft size={20} />
+          </Button>
+          <div>
+            <h1 className="font-semibold">{selectedGame.peerName}</h1>
+            <p className="text-sm text-gray-500">Glorp</p>
+          </div>
+        </div>
+
+        {/* Messages */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {messages.length === 0 ? (
+            <div className="text-center py-8">
+              <Trophy size={48} className="mx-auto text-gray-400 mb-3" />
+              <p className="text-gray-600">No challenges yet</p>
+              <p className="text-sm text-gray-500">Record a sound to start!</p>
+            </div>
+          ) : (
+            messages.map((message) => (
+              <div
+                key={message.id}
+                className={`flex ${message.sender === address ? 'justify-end' : 'justify-start'}`}
+              >
+                <div
+                  className={`max-w-xs p-3 rounded-lg ${
+                    message.sender === address
+                      ? 'bg-blue-500 text-white'
+                      : 'bg-white border border-gray-200'
+                  }`}
+                >
+                  <div className="flex items-center space-x-2 mb-2">
+                    <Button
+                      onClick={() => playAudio(message.audioUrl)}
+                      disabled={isPlaying}
+                      variant="outline"
+                      size="sm"
+                      className={message.sender === address ? 'text-white border-white' : ''}
+                    >
+                      <Volume2 size={16} />
+                      <span>Play</span>
+                    </Button>
+                  </div>
+                  
+                  {message.sender !== address && !message.guess && (
+                    <div className="space-y-2">
+                      <input
+                        type="text"
+                        placeholder="What do you think this is?"
+                        value={guess}
+                        onChange={(e) => setGuess(e.target.value)}
+                        className="w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none bg-white text-gray-900"
+                      />
+                      <Button
+                        onClick={() => sendGuess(message.id)}
+                        disabled={!guess.trim() || isLoading}
+                        size="sm"
+                        className="w-full"
+                      >
+                        Send Guess
+                      </Button>
+                    </div>
+                  )}
+
+                  {message.guess && (
+                    <div className="mt-2 p-2 bg-yellow-50 rounded border">
+                      <p className="text-sm">
+                        <strong>Guess:</strong> {message.guess}
+                      </p>
+                      {message.correctAnswer && (
+                        <p className="text-sm mt-1">
+                          <strong>Answer:</strong> {message.correctAnswer}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Recording Section */}
+        <div className="bg-white border-t border-gray-200 p-4">
+          {!assignedSound ? (
+            <Button
+              onClick={getNewSoundChallenge}
+              className="w-full bg-green-500 text-white py-4 text-lg font-semibold"
+            >
+              Get Sound Challenge
+            </Button>
+          ) : (
+            <div className="space-y-4">
+              <div className="bg-blue-50 p-3 rounded-lg">
+                <h3 className="font-semibold text-blue-900">Your Challenge:</h3>
+                <p className="text-blue-800">{assignedSound.name}</p>
+                <p className="text-sm text-blue-600">{assignedSound.description}</p>
+              </div>
+              
+              <div className="flex items-center justify-center space-x-4">
+                <Button
+                  onClick={isRecording ? stopRecording : startRecording}
+                  disabled={isLoading}
+                  className={`flex items-center space-x-2 px-6 py-3 ${
+                    isRecording ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'
+                  } text-white`}
+                >
+                  <Mic size={20} />
+                  <span>{isRecording ? 'Stop' : 'Record'}</span>
+                </Button>
+                
+                {audioUrl && (
+                  <>
+                    <Button
+                      onClick={() => playAudio(audioUrl)}
+                      disabled={isPlaying}
+                      variant="outline"
+                      size="sm"
+                      className="px-4 py-3"
+                    >
+                      <Play size={20} />
+                    </Button>
+                    <Button
+                      onClick={() => {
+                        setAudioBlob(null);
+                        setAudioUrl(null);
+                      }}
+                      variant="outline"
+                      size="sm"
+                      className="px-4 py-3"
+                    >
+                      <X size={20} />
+                    </Button>
+                  </>
+                )}
+              </div>
+              
+              {audioUrl && (
+                <Button
+                  onClick={sendAudioChallenge}
+                  disabled={isLoading}
+                  className="w-full bg-blue-500 text-white py-3"
+                  icon={<Send size={20} />}
+                >
+                  {isLoading ? 'Sending...' : 'Send Challenge'}
+                </Button>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Hidden audio element */}
+        <audio ref={audioRef} style={{ display: 'none' }} />
+      </div>
+    );
+  }
+
+  // Settings screen
+  if (currentView === 'settings') {
+    return (
+      <div className="flex flex-col h-screen bg-gray-50">
+        {/* Header */}
+        <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setCurrentView('main')}
+            className="mr-3"
+          >
+            <ChevronLeft size={20} />
+          </Button>
+          <h1 className="text-lg font-semibold">Settings</h1>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 p-4">
+          <div className="bg-white rounded-lg p-6">
+            <h2 className="text-lg font-semibold mb-4">Game Settings</h2>
+            <p className="text-gray-600 mb-4">
+              Glorp is a fun game where you record sounds and challenge friends to guess what they are!
+            </p>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <span>Connected to XMTP</span>
+                <span className={isConnectedToXMTP ? 'text-green-500' : 'text-red-500'}>
+                  {isConnectedToXMTP ? '✓' : '✗'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <span>Active Games</span>
+                <span className="font-semibold">{games.length}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+} 
