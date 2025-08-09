@@ -27,7 +27,8 @@ import {
   ChevronLeft,
   Gamepad2,
   Trophy,
-  Users
+  Users,
+  Trash2
 } from 'lucide-react';
 import { xmtpGameClient, AudioMessage } from '../../lib/xmtp-client';
 import { getRandomSound, Sound } from '../../lib/sound-library';
@@ -64,6 +65,8 @@ export function MobileGame({}: MobileGameProps) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [assignedSound, setAssignedSound] = useState<Sound | null>(null);
   const [guess, setGuess] = useState('');
+  const [chatText, setChatText] = useState('');
+  const [expandedRoundId, setExpandedRoundId] = useState<string | null>(null);
   
   // New game state
   const [newPeerAddress, setNewPeerAddress] = useState('');
@@ -151,10 +154,22 @@ export function MobileGame({}: MobileGameProps) {
 
       conversations.forEach((conv: any) => {
         const idCandidate = String(
-          conv?.dmId || conv?.id || conv?.conversationId || conv?.topic || conv?.groupId || conv?.inboxId || conv?.peerInboxId || ''
+          (typeof conv?.dmId === 'string' && conv.dmId) ||
+          (typeof conv?.id === 'string' && conv.id) ||
+          (typeof conv?.conversationId === 'string' && conv.conversationId) ||
+          (typeof conv?.topic === 'string' && conv.topic) ||
+          (typeof conv?.groupId === 'string' && conv.groupId) ||
+          (typeof conv?.inboxId === 'string' && conv.inboxId) ||
+          ''
         );
-        const peerCandidate = String(conv?.peerInboxId || conv?.peerAddress || conv?.inboxId || '');
-        const labelSource = peerCandidate || idCandidate || 'Unknown';
+        const rawPeer = (typeof conv?.peerAddress === 'string' ? conv.peerAddress : undefined) ||
+                        (typeof conv?.peerInboxId === 'string' ? conv.peerInboxId : undefined) ||
+                        (typeof conv?.inboxId === 'string' ? conv.inboxId : undefined);
+        const peerCandidate = rawPeer ? String(rawPeer) : '';
+        let labelSource = peerCandidate || idCandidate || 'Unknown';
+        if (typeof labelSource === 'string' && labelSource.startsWith('async')) {
+          labelSource = 'Unknown';
+        }
         const isHexLike = labelSource.startsWith('0x') && labelSource.length >= 10;
         const peerName = isHexLike ? `${labelSource.slice(0, 6)}...${labelSource.slice(-4)}` : labelSource;
         const game: Game = {
@@ -176,6 +191,8 @@ export function MobileGame({}: MobileGameProps) {
       // Merge with local games (by id+peer combo)
       const mergedGames = [...games];
       xmtpGameList.forEach(xmtpGame => {
+        const invalid = !xmtpGame.peerAddress || xmtpGame.peerAddress === 'unknown' || xmtpGame.peerName === 'Unknown' || xmtpGame.peerName.startsWith('async');
+        if (invalid) return;
         const exists = mergedGames.some(g => g.id === xmtpGame.id || g.peerAddress === xmtpGame.peerAddress);
         if (!exists) mergedGames.push(xmtpGame);
       });
@@ -343,6 +360,21 @@ export function MobileGame({}: MobileGameProps) {
       
       // Listen for messages
       await xmtpGameClient.listenToMessages(conversation, (message) => {
+        // If this is a guess update, merge into the original round
+        if (message.type === 'guess' && message.id) {
+          const merged: AudioMessage[] = messages.map((m: AudioMessage) => {
+            if (m.id === message.id) {
+              const solved = !!(m.correctAnswer && message.guess && m.correctAnswer.toLowerCase().trim() === message.guess.toLowerCase().trim());
+              return { ...m, guess: message.guess, isSolved: solved } as AudioMessage;
+            }
+            return m as AudioMessage;
+          });
+          setMessages(merged);
+          saveMessagesToStorage(merged);
+          return;
+        }
+
+        // Normal new message
         const updatedMessages = [...messages, message];
         setMessages(updatedMessages);
         saveMessagesToStorage(updatedMessages);
@@ -358,14 +390,12 @@ export function MobileGame({}: MobileGameProps) {
           };
           setPendingInvitations(prev => [...prev, newInvitation]);
         } else {
-          // Update unread count for existing game
-          const updatedGames = games.map(game => 
-            game.peerAddress === message.sender 
-              ? { ...game, unreadCount: game.unreadCount + 1 }
-              : game
-          );
-          setGames(updatedGames);
-          saveGamesToStorage(updatedGames);
+          const updatedGamesForUnread = games.map(gameItem => {
+            if (gameItem.peerAddress !== message.sender) return gameItem;
+            return { ...gameItem, unreadCount: gameItem.unreadCount + 1 };
+          });
+          setGames(updatedGamesForUnread);
+          saveGamesToStorage(updatedGamesForUnread);
         }
       });
       
@@ -434,6 +464,18 @@ export function MobileGame({}: MobileGameProps) {
     const sound = getRandomSound();
     setAssignedSound(sound);
   };
+
+  const deleteGame = useCallback((game: Game) => {
+    if (!game) return;
+    const filtered = games.filter(g => !(g.id === game.id || g.peerAddress === game.peerAddress));
+    setGames(filtered);
+    try { localStorage.setItem('glorp-games', JSON.stringify(filtered)); } catch {}
+    if (selectedGame && (selectedGame.id === game.id || selectedGame.peerAddress === game.peerAddress)) {
+      setSelectedGame(null);
+      setCurrentConversation(null);
+      setCurrentView('main');
+    }
+  }, [games, selectedGame]);
 
   // Main screen
   if (currentView === 'main') {
@@ -615,7 +657,7 @@ export function MobileGame({}: MobileGameProps) {
     return (
       <div className="flex flex-col h-screen bg-gray-50">
         {/* Header */}
-        <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center">
+        <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
           <Button
             variant="ghost"
             size="sm"
@@ -624,10 +666,18 @@ export function MobileGame({}: MobileGameProps) {
           >
             <ChevronLeft size={20} />
           </Button>
-          <div>
+          <div className="flex-1">
             <h1 className="font-semibold">{selectedGame.peerName}</h1>
             <p className="text-sm text-gray-600">Glorp</p>
           </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-gray-500"
+            onClick={() => deleteGame(selectedGame)}
+          >
+            <Trash2 size={18} />
+          </Button>
         </div>
 
         {/* Messages */}
@@ -647,55 +697,71 @@ export function MobileGame({}: MobileGameProps) {
                 <div
                   className={`max-w-xs p-3 rounded-lg ${
                     message.sender === address
-                      ? 'bg-blue-500 text-white'
-                      : 'bg-white border border-gray-200'
-                  }`}
+                                            ? 'bg-blue-500 text-white'
+                      : 'bg-white border border-gray-200 text-gray-900'
+                   }`}
                 >
-                  <div className="flex items-center space-x-2 mb-2">
-                    <Button
-                      onClick={() => playAudio(message.audioUrl)}
-                      disabled={isPlaying}
-                      variant="outline"
-                      size="sm"
-                      className={message.sender === address ? 'text-white border-white' : ''}
-                    >
-                      <Volume2 size={16} />
-                      <span>Play</span>
-                    </Button>
-                  </div>
-                  
-                  {message.sender !== address && !message.guess && (
-                    <div className="space-y-2">
-                      <input
-                        type="text"
-                        placeholder="What do you think this is?"
-                        value={guess}
-                        onChange={(e) => setGuess(e.target.value)}
-                        className="w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none bg-white text-gray-900"
-                      />
-                      <Button
-                        onClick={() => sendGuess(message.id)}
-                        disabled={!guess.trim() || isLoading}
-                        size="sm"
-                        className="w-full"
-                      >
-                        Send Guess
-                      </Button>
+                  {/* Text chat bubble */}
+                  {message.text && (
+                    <div className="text-sm whitespace-pre-wrap break-words">
+                      {message.text}
                     </div>
                   )}
 
-                  {message.guess && (
-                    <div className="mt-2 p-2 bg-yellow-50 rounded border">
-                      <p className="text-sm">
-                        <strong>Guess:</strong> {message.guess}
-                      </p>
-                      {message.correctAnswer && (
-                        <p className="text-sm mt-1">
-                          <strong>Answer:</strong> {message.correctAnswer}
-                        </p>
+                  {/* Audio round bubble */}
+                  {!message.text && (
+                    <>
+                      <div className="flex items-center space-x-2 mb-2">
+                        <Button
+                          onClick={() => playAudio(message.audioUrl ?? '')}
+                          disabled={isPlaying}
+                          variant="outline"
+                          size="sm"
+                          className={message.sender === address ? 'text-white border-white' : ''}
+                        >
+                          <Volume2 size={16} />
+                          <span>Play</span>
+                        </Button>
+                        {message.correctAnswer && message.guess && (
+                          <span className={`text-xs font-semibold ${message.guess.toLowerCase().trim() === message.correctAnswer.toLowerCase().trim() ? 'text-green-600' : 'text-red-600'}`}>
+                            {message.guess.toLowerCase().trim() === message.correctAnswer.toLowerCase().trim() ? 'Solved' : 'Incorrect'}
+                          </span>
+                        )}
+                        {message.sender !== address && (!message.guess || (message.correctAnswer && message.guess.toLowerCase().trim() !== message.correctAnswer.toLowerCase().trim())) && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => setExpandedRoundId(expandedRoundId === message.id ? null : message.id)}
+                          >
+                            {expandedRoundId === message.id ? 'Hide' : 'Guess'}
+                          </Button>
+                        )}
+                      </div>
+ 
+                      {/* Guess input only when expanded */}
+                      {expandedRoundId === message.id && message.sender !== address && (!message.guess || (message.correctAnswer && message.guess.toLowerCase().trim() !== message.correctAnswer.toLowerCase().trim())) && (
+                        <div className="space-y-2">
+                          <input
+                            type="text"
+                            placeholder="Your guess"
+                            value={guess}
+                            onChange={(e) => setGuess(e.target.value)}
+                            className="w-full px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none bg-white text-gray-900"
+                          />
+                          <Button
+                            onClick={() => sendGuess(message.id)}
+                            disabled={!guess.trim() || isLoading}
+                            size="sm"
+                            className="w-full"
+                          >
+                            Submit Guess
+                          </Button>
+                        </div>
                       )}
-                    </div>
+                    </>
                   )}
+
+                  {/* End bubble content */}
                 </div>
               </div>
             ))
@@ -703,7 +769,49 @@ export function MobileGame({}: MobileGameProps) {
         </div>
 
         {/* Recording Section */}
-        <div className="bg-white border-t border-gray-200 p-4">
+        <div className="bg-white border-t border-gray-200 p-4 space-y-3">
+          {/* Text composer */}
+          <div className="flex items-center space-x-2">
+            <input
+              type="text"
+              placeholder="Message… 😊"
+              value={chatText}
+              onChange={(e) => setChatText(e.target.value)}
+              className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+            />
+            <Button
+              onClick={async () => {
+                if (!currentConversation || !chatText.trim()) return;
+                setIsLoading(true);
+                try {
+                  await xmtpGameClient.sendTextMessage(currentConversation, chatText);
+                  const newMsg = {
+                    id: Date.now().toString(),
+                    text: chatText,
+                    timestamp: new Date(),
+                    sender: address!,
+                  } as any;
+                  const updated = [...messages, newMsg];
+                  setMessages(updated);
+                  saveMessagesToStorage(updated);
+                } finally {
+                  setIsLoading(false);
+                  setChatText('');
+                }
+              }}
+              disabled={!chatText.trim() || isLoading}
+            >
+              Send
+            </Button>
+            <Button
+              variant="outline"
+              onClick={getNewSoundChallenge}
+              className="px-3"
+            >
+              + Game
+            </Button>
+          </div>
+
           {!assignedSound ? (
             <Button
               onClick={getNewSoundChallenge}

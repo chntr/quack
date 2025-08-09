@@ -2,12 +2,15 @@ import { WalletClient } from 'viem';
 
 export interface AudioMessage {
   id: string;
-  audioUrl: string;
-  filename: string;
+  audioUrl?: string;
+  filename?: string;
   timestamp: Date;
   sender: string;
   guess?: string;
   correctAnswer?: string;
+  text?: string;
+  isSolved?: boolean;
+  type?: 'audio' | 'text' | 'guess';
 }
 
 export interface GameState {
@@ -74,8 +77,11 @@ class XMTPGameClient {
       console.log('✅ Found conversations:', conversations.length);
 
       conversations.forEach((conv: any) => {
-        const peer = (conv?.peerAddress ?? conv?.peerAddress?.address ?? conv?.inboxId ?? conv?.peerInboxId ?? 'unknown');
-        if (peer !== 'unknown') {
+        const peerRaw = (typeof conv?.peerAddress === 'string' ? conv.peerAddress : undefined)
+          || (typeof conv?.peerInboxId === 'string' ? conv.peerInboxId : undefined)
+          || (typeof conv?.inboxId === 'string' ? conv.inboxId : undefined);
+        const peer = peerRaw || 'unknown';
+        if (peer !== 'unknown' && !String(peer).startsWith('async')) {
           this.conversations.set(peer, conv);
         }
       });
@@ -181,6 +187,24 @@ class XMTPGameClient {
     }
   }
 
+  async sendTextMessage(conversation: any, text: string): Promise<void> {
+    if (!this.isConnectedState) throw new Error('Client not connected');
+    try {
+      const payload = {
+        type: 'text',
+        text,
+        timestamp: new Date().toISOString(),
+      };
+      const messageText = JSON.stringify(payload);
+      console.log('💬 Sending text message:', messageText);
+      await conversation.send(messageText);
+      console.log('✅ Text message sent');
+    } catch (error) {
+      console.error('❌ Failed to send text message:', error);
+      throw error;
+    }
+  }
+
   async sendGuess(
     conversation: any,
     guess: string,
@@ -235,17 +259,34 @@ class XMTPGameClient {
             const parsed = typeof content === 'string' ? JSON.parse(content) : content;
 
             if (parsed?.type === 'audio-challenge') {
-                           const audioMessage: AudioMessage = {
-               id: message.id || message.messageId || Date.now().toString(),
-               audioUrl: parsed.audioUrl || parsed.audioData,
-               filename: parsed.filename,
-               timestamp: new Date(parsed.timestamp || Date.now()),
-               sender: message.senderAddress || message.senderInboxId || message.from || 'unknown',
-               correctAnswer: parsed.correctAnswer,
-             };
+              const audioMessage: AudioMessage = {
+                id: message.id || message.messageId || Date.now().toString(),
+                audioUrl: parsed.audioUrl || parsed.audioData,
+                filename: parsed.filename,
+                timestamp: new Date(parsed.timestamp || Date.now()),
+                sender: message.senderAddress || message.senderInboxId || message.from || 'unknown',
+                correctAnswer: parsed.correctAnswer,
+                type: 'audio',
+              };
               onMessage(audioMessage);
+            } else if (parsed?.type === 'text') {
+              const textMessage: AudioMessage = {
+                id: message.id || message.messageId || Date.now().toString(),
+                text: parsed.text,
+                timestamp: new Date(parsed.timestamp || Date.now()),
+                sender: message.senderAddress || message.senderInboxId || message.from || 'unknown',
+                type: 'text',
+              };
+              onMessage(textMessage);
             } else if (parsed?.type === 'guess') {
-              console.log('🤔 Received guess:', parsed);
+              const guessUpdate: AudioMessage = {
+                id: parsed.originalMessageId,
+                guess: parsed.guess,
+                timestamp: new Date(parsed.timestamp || Date.now()),
+                sender: message.senderAddress || message.senderInboxId || message.from || 'unknown',
+                type: 'guess',
+              };
+              onMessage(guessUpdate);
             }
           } catch (err) {
             console.error('❌ Failed to process streamed message:', err);
@@ -310,9 +351,28 @@ class XMTPGameClient {
           timestamp: new Date(parsed.timestamp || Date.now()),
           sender: message.senderAddress || message.senderInboxId || message.from || 'unknown',
           correctAnswer: parsed.correctAnswer,
+          type: 'audio',
         };
         console.log('✅ Created global audio message:', audioMessage);
         onNewMessage(audioMessage);
+      } else if (parsed.type === 'text') {
+        const textMessage: AudioMessage = {
+          id: message.id || message.messageId || Date.now().toString(),
+          text: parsed.text,
+          timestamp: new Date(parsed.timestamp || Date.now()),
+          sender: message.senderAddress || message.senderInboxId || message.from || 'unknown',
+          type: 'text',
+        };
+        onNewMessage(textMessage);
+      } else if (parsed.type === 'guess') {
+        const guessUpdate: AudioMessage = {
+          id: parsed.originalMessageId,
+          guess: parsed.guess,
+          timestamp: new Date(parsed.timestamp || Date.now()),
+          sender: message.senderAddress || message.senderInboxId || message.from || 'unknown',
+          type: 'guess',
+        };
+        onNewMessage(guessUpdate);
       }
     } catch (error) {
       console.error('❌ Failed to process global message:', error);
